@@ -65,16 +65,22 @@ impl QueueScheduleRepository for PgQueueScheduleRepository<'_> {
     }
 
     async fn list(&mut self) -> Result<Vec<ScheduleStatus>, Self::Error> {
+        // The job is looked up in a subquery and not through a join: this
+        // table only has a handful of rows and may never have been analyzed,
+        // in which case the planner joins by scanning the whole `queue_jobs`
+        // table. This runs every second on the leader.
         let res = sqlx::query_as!(
             ScheduleLookup,
             r#"
                 SELECT
                     queue_schedules.schedule_name as "schedule_name!",
                     queue_schedules.last_scheduled_at,
-                    queue_jobs.status IN ('completed', 'failed') as last_scheduled_job_completed
+                    (
+                        SELECT queue_jobs.status IN ('completed', 'failed')
+                        FROM queue_jobs
+                        WHERE queue_jobs.queue_job_id = queue_schedules.last_scheduled_job_id
+                    ) as last_scheduled_job_completed
                 FROM queue_schedules
-                LEFT JOIN queue_jobs
-                    ON queue_jobs.queue_job_id = queue_schedules.last_scheduled_job_id
             "#
         )
         .traced()

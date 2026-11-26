@@ -171,6 +171,11 @@ pub enum QueueRunnerError {
 const MIN_SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(900);
 const MAX_SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(1100);
 
+// How long to wait between two runs of the leader duties. They only look at
+// the recurring schedules, so they don't need to run on every wakeup. This is
+// the shortest sleep, so that an idle leader still runs them on every wakeup
+const LEADER_DUTIES_INTERVAL: std::time::Duration = MIN_SLEEP_DURATION;
+
 // How many jobs can we run concurrently
 const MAX_CONCURRENT_JOBS: usize = 10;
 
@@ -219,6 +224,7 @@ pub struct QueueWorker {
     listener: PgListener,
     registration: Worker,
     am_i_leader: bool,
+    last_leader_duties: Option<Instant>,
     last_heartbeat: DateTime<Utc>,
     cancellation_token: CancellationToken,
     #[expect(dead_code, reason = "This is used on Drop")]
@@ -300,6 +306,7 @@ impl QueueWorker {
             listener,
             registration,
             am_i_leader: false,
+            last_leader_duties: None,
             last_heartbeat: now,
             cancellation_token,
             cancellation_guard,
@@ -409,8 +416,12 @@ impl QueueWorker {
         let start = Instant::now();
         self.tick().await?;
 
-        if self.am_i_leader {
+        let leader_duties_due = self
+            .last_leader_duties
+            .is_none_or(|last| last.elapsed() >= LEADER_DUTIES_INTERVAL);
+        if self.am_i_leader && leader_duties_due {
             self.perform_leader_duties().await?;
+            self.last_leader_duties = Some(Instant::now());
         }
 
         let elapsed = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
