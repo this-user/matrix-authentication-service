@@ -356,6 +356,7 @@ where
     UrlBuilder: FromRef<S>,
     PreferredLanguage: FromRequestParts<S>,
     BoxRepository: FromRequestParts<S>,
+    BoxRepositoryFactory: FromRef<S>,
     CookieJar: FromRequestParts<S>,
     BoundActivityTracker: FromRequestParts<S>,
     RequesterFingerprint: FromRequestParts<S>,

@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock, RwLockWriteGuard};
 
 use crate::{HomeserverConnection as _, MatrixUser, ProvisionRequest};
 
@@ -35,6 +35,9 @@ pub struct HomeserverConnection {
     users: RwLock<HashMap<String, MockUser>>,
     reserved_localparts: RwLock<HashSet<&'static str>>,
     fail_localpart_availability: AtomicBool,
+    fail_provisioning: AtomicBool,
+    provisioning_lock: RwLock<()>,
+    provisioning_reached: Notify,
 }
 
 impl HomeserverConnection {
@@ -52,6 +55,9 @@ impl HomeserverConnection {
             users: RwLock::new(HashMap::new()),
             reserved_localparts: RwLock::new(HashSet::new()),
             fail_localpart_availability: AtomicBool::new(false),
+            fail_provisioning: AtomicBool::new(false),
+            provisioning_lock: RwLock::new(()),
+            provisioning_reached: Notify::new(),
         }
     }
 
@@ -64,6 +70,18 @@ impl HomeserverConnection {
     pub fn fail_localpart_availability(&self) {
         self.fail_localpart_availability
             .store(true, Ordering::Relaxed);
+    }
+
+    pub fn fail_provisioning(&self, fail: bool) {
+        self.fail_provisioning.store(fail, Ordering::Relaxed);
+    }
+
+    pub async fn block_provisioning(&self) -> RwLockWriteGuard<'_, ()> {
+        self.provisioning_lock.write().await
+    }
+
+    pub async fn provisioning_reached(&self) {
+        self.provisioning_reached.notified().await;
     }
 
     /// Like `query_user` but get the raw test state of the user.
@@ -101,6 +119,14 @@ impl crate::HomeserverConnection for HomeserverConnection {
     }
 
     async fn provision_user(&self, request: &ProvisionRequest) -> Result<bool, anyhow::Error> {
+        self.provisioning_reached.notify_one();
+        let _provisioning = self.provisioning_lock.read().await;
+
+        anyhow::ensure!(
+            !self.fail_provisioning.load(Ordering::Relaxed),
+            "Mock homeserver failure while provisioning the user"
+        );
+
         let mut users = self.users.write().await;
         let mxid = self.mxid(request.localpart());
         let inserted = !users.contains_key(&mxid);

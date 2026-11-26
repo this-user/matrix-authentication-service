@@ -13,16 +13,18 @@ use axum::{
 use axum_extra::TypedHeader;
 use chrono::Duration;
 use mas_axum_utils::{InternalError, RecordAsRequester, SessionInfoExt as _, cookies::CookieJar};
-use mas_data_model::{BoxClock, BoxRng, SiteConfig};
-use mas_matrix::HomeserverConnection;
+use mas_context::LogContext;
+use mas_data_model::{BoxClock, BoxRng, BrowserSession, SiteConfig, User};
+use mas_matrix::{HomeserverConnection, ProvisionRequest};
 use mas_router::{PostAuthAction, UrlBuilder};
 use mas_storage::{
-    BoxRepository,
+    BoxRepository, BoxRepositoryFactory, RepositoryError,
     queue::{ProvisionUserJob, QueueJobRepositoryExt as _},
     user::UserEmailFilter,
 };
 use mas_templates::{RegisterStepsEmailInUseContext, TemplateContext as _, Templates};
 use opentelemetry::metrics::Counter;
+use tracing::Instrument as _;
 use ulid::Ulid;
 
 use super::super::cookie::UserRegistrationSessions;
@@ -51,6 +53,7 @@ pub(crate) async fn get(
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     State(url_builder): State<UrlBuilder>,
     State(homeserver): State<Arc<dyn HomeserverConnection>>,
+    State(repository_factory): State<BoxRepositoryFactory>,
     State(templates): State<Templates>,
     State(site_config): State<SiteConfig>,
     PreferredLanguage(lang): PreferredLanguage,
@@ -316,7 +319,9 @@ pub(crate) async fn get(
         .add(&mut rng, &clock, &user, user_agent)
         .await?;
 
+    let mut emails = Vec::new();
     if let Some(email_authentication) = email_authentication {
+        emails.push(email_authentication.email.clone());
         repo.user_email()
             .add(&mut rng, &clock, &user, email_authentication.email)
             .await?;
@@ -363,17 +368,24 @@ pub(crate) async fn get(
             .await?;
     }
 
-    let mut job = ProvisionUserJob::new(&user);
-    if let Some(display_name) = registration.display_name {
-        job = job.set_display_name(display_name);
-    }
-    repo.queue_job().schedule_job(&mut rng, &clock, job).await?;
-
-    repo.save().await?;
-
-    activity_tracker
-        .record_browser_session(&clock, &user_session)
-        .await;
+    let task = save_and_provision(
+        repo,
+        repository_factory,
+        homeserver,
+        activity_tracker,
+        rng,
+        clock,
+        user,
+        user_session.clone(),
+        emails,
+        registration.display_name,
+    )
+    .in_current_span();
+    let task = match LogContext::maybe_with(LogContext::clone) {
+        Some(log_context) => tokio::spawn(log_context.run(|| task)),
+        None => tokio::spawn(task),
+    };
+    task.await??;
 
     let post_auth_action: Option<PostAuthAction> = registration
         .post_auth_action
@@ -388,4 +400,232 @@ pub(crate) async fn get(
         OptionalPostAuthAction::from(post_auth_action).go_next(&url_builder),
     )
         .into_response());
+}
+
+async fn save_and_provision(
+    repo: BoxRepository,
+    repository_factory: BoxRepositoryFactory,
+    homeserver: Arc<dyn HomeserverConnection>,
+    activity_tracker: BoundActivityTracker,
+    mut rng: BoxRng,
+    clock: BoxClock,
+    user: User,
+    user_session: BrowserSession,
+    emails: Vec<String>,
+    display_name: Option<String>,
+) -> Result<(), RepositoryError> {
+    repo.save().await?;
+
+    activity_tracker
+        .record_browser_session(&clock, &user_session)
+        .await;
+
+    let mut request = ProvisionRequest::new(&user.username, &user.sub, false).set_emails(emails);
+    if let Some(display_name) = &display_name {
+        request = request.set_displayname(display_name.clone());
+    }
+    let Err(error) = homeserver.provision_user(&request).await else {
+        return Ok(());
+    };
+    tracing::warn!(
+        error = &*error as &dyn std::error::Error,
+        user.id = %user.id,
+        "Failed to provision the user on the homeserver during registration, leaving it to the provisioning job"
+    );
+
+    let mut job = ProvisionUserJob::new(&user);
+    if let Some(display_name) = display_name {
+        job = job.set_display_name(display_name);
+    }
+    let mut repo = repository_factory.create().await?;
+    repo.queue_job().schedule_job(&mut rng, &clock, job).await?;
+    repo.save().await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper::{Request, StatusCode, header::LOCATION};
+    use mas_data_model::SiteConfig;
+    use mas_matrix::HomeserverConnection;
+    use mas_router::Route as _;
+    use sqlx::PgPool;
+
+    use crate::test_utils::{
+        CookieHelper, RequestBuilderExt, ResponseExt, TestState, setup, test_site_config,
+    };
+
+    async fn test_state(pool: PgPool) -> TestState {
+        TestState::from_pool_with_site_config(
+            pool,
+            SiteConfig {
+                password_registration_email_required: false,
+                ..test_site_config()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn register_up_to_finish(state: &TestState, cookies: &CookieHelper) -> String {
+        let request = Request::get(&*mas_router::Register::default().path_and_query()).empty();
+        let request = cookies.with_cookies(request);
+        let response = state.request(request).await;
+        cookies.save_cookies(&response);
+        response.assert_status(StatusCode::OK);
+        let csrf_token = crate::views::register::tests::csrf_token(response.body()).to_owned();
+
+        let request = Request::post(&*mas_router::Register::default().path_and_query()).form(
+            serde_json::json!({
+                "csrf": csrf_token,
+                "username": "alice",
+                "password": "correcthorsebatterystaple",
+                "password_confirm": "correcthorsebatterystaple",
+                "accept_terms": "on",
+            }),
+        );
+        let request = cookies.with_cookies(request);
+        let response = state.request(request).await;
+        cookies.save_cookies(&response);
+        response.assert_status(StatusCode::SEE_OTHER);
+        let finish = response
+            .headers()
+            .get(LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let request = cookies.with_cookies(Request::get(&*finish).empty());
+        let response = state.request(request).await;
+        cookies.save_cookies(&response);
+        response.assert_status(StatusCode::SEE_OTHER);
+        let display_name = response
+            .headers()
+            .get(LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let request = cookies.with_cookies(Request::get(&*display_name).empty());
+        let response = state.request(request).await;
+        cookies.save_cookies(&response);
+        response.assert_status(StatusCode::OK);
+        let csrf_token = response
+            .body()
+            .split("name=\"csrf\" value=\"")
+            .nth(1)
+            .expect("the page should have a CSRF token")
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let request = Request::post(&*display_name).form(serde_json::json!({
+            "csrf": csrf_token,
+            "action": "set",
+            "display_name": "Alice",
+        }));
+        let request = cookies.with_cookies(request);
+        let response = state.request(request).await;
+        cookies.save_cookies(&response);
+        response.assert_status(StatusCode::SEE_OTHER);
+
+        finish
+    }
+
+    async fn count_provisioning_jobs(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM queue_jobs WHERE queue_name = 'provision-user'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrator = "mas_storage_pg::MIGRATOR")]
+    async fn test_finish_provisions_user_synchronously(pool: PgPool) {
+        setup();
+        let state = test_state(pool.clone()).await;
+        let cookies = CookieHelper::new();
+        let finish = register_up_to_finish(&state, &cookies).await;
+
+        assert!(
+            state
+                .homeserver_connection
+                .query_user("alice")
+                .await
+                .is_err()
+        );
+
+        let request = cookies.with_cookies(Request::get(&*finish).empty());
+        let response = state.request(request).await;
+        response.assert_status(StatusCode::SEE_OTHER);
+
+        let user = state
+            .homeserver_connection
+            .query_user("alice")
+            .await
+            .unwrap();
+        assert_eq!(user.displayname.as_deref(), Some("Alice"));
+        assert_eq!(count_provisioning_jobs(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrator = "mas_storage_pg::MIGRATOR")]
+    async fn test_finish_schedules_provisioning_job_on_homeserver_failure(pool: PgPool) {
+        setup();
+        let state = test_state(pool.clone()).await;
+        let cookies = CookieHelper::new();
+        let finish = register_up_to_finish(&state, &cookies).await;
+
+        state.homeserver_connection.fail_provisioning(true);
+        let request = cookies.with_cookies(Request::get(&*finish).empty());
+        let response = state.request(request).await;
+        response.assert_status(StatusCode::SEE_OTHER);
+
+        assert!(
+            state
+                .homeserver_connection
+                .query_user("alice")
+                .await
+                .is_err()
+        );
+        assert_eq!(count_provisioning_jobs(&pool).await, 1);
+
+        state.homeserver_connection.fail_provisioning(false);
+        state.run_jobs_in_queue().await;
+
+        let user = state
+            .homeserver_connection
+            .query_user("alice")
+            .await
+            .unwrap();
+        assert_eq!(user.displayname.as_deref(), Some("Alice"));
+    }
+
+    #[sqlx::test(migrator = "mas_storage_pg::MIGRATOR")]
+    async fn test_finish_provisions_user_when_request_is_dropped(pool: PgPool) {
+        setup();
+        let state = test_state(pool).await;
+        let cookies = CookieHelper::new();
+        let finish = register_up_to_finish(&state, &cookies).await;
+
+        let blocked = state.homeserver_connection.block_provisioning().await;
+        let request = cookies.with_cookies(Request::get(&*finish).empty());
+        tokio::select! {
+            _ = state.request(request) => panic!("the homeserver is not answering"),
+            () = state.homeserver_connection.provisioning_reached() => {}
+        }
+        drop(blocked);
+        drop(state.homeserver_connection.block_provisioning().await);
+
+        let mut repo = state.repository().await.unwrap();
+        assert!(repo.user().exists("alice").await.unwrap());
+        let user = state
+            .homeserver_connection
+            .query_user("alice")
+            .await
+            .unwrap();
+        assert_eq!(user.displayname.as_deref(), Some("Alice"));
+    }
 }
